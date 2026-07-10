@@ -1,0 +1,34 @@
+name: Predicciones semanales
+
+on:
+  schedule:
+    - cron: '0 14 * * 2'   # martes 14:00 UTC (~8:00 CDMX)
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  predecir:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Generar predicciones
+        run: python actualizar.py
+
+      - name: Commit de predicciones
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add predicciones.csv
+          git diff --cached --quiet || git commit -m "Predicciones automáticas $(date +%F)"
+          git push

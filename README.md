@@ -1,22 +1,29 @@
 # 🏈 Predictor NFL
 
-Notebook que predice juegos de NFL con datos de [nflverse](https://github.com/nflverse) y XGBoost.
+Predicción de juegos NFL con datos de [nflverse](https://github.com/nflverse) y XGBoost.
 
 ## Qué predice
 
-- Puntos por equipo y puntos totales del juego
-- Probabilidad de victoria
-- Yardas de pase por jugador (QB)
-- Yardas por tierra por jugador (RB/QB)
-- Yardas recibidas por jugador (WR/TE/RB)
+**Por juego:** puntos por equipo, puntos totales, spread, probabilidad de victoria calibrada.
 
-## Qué usa
+**Por jugador (props):** yardas de pase/tierra/recepción con rango de incertidumbre propio por jugador (quantile regression), touchdowns (esperado + probabilidad de ≥1), recepciones e intercepciones (Poisson).
 
-- **EPA por jugada** (play-by-play) — calidad ofensiva/defensiva
-- **Líneas de Vegas** (spread/total del calendario oficial) como features
-- **Rosters y depth charts oficiales 2026** — titulares reales (QB1, RB1-2, WR1-3, TE1-2)
-- **Reportes de lesión** — excluye jugadores Out/Doubtful (durante la temporada)
-- **Registro de predicciones** (`predicciones.csv`) — mide tu acierto contra resultados y contra Vegas
+## Cómo funciona
+
+- **Modelo dual:** `modelo_vegas` (usa líneas de Vegas → marcadores finos) + `modelo_puro` (sin Vegas → opinión propia). Cuando el puro discrepa >4 pts de Vegas, el juego se marca `value`.
+- **Features:** forma de últimos 5 juegos (puntos, yardas, EPA ofensivo/defensivo de play-by-play), localía, descanso, juego divisional, clima (domo/temperatura/viento), líneas de Vegas.
+- **Props:** rosters y depth charts oficiales de la temporada actual (titulares QB1, RB1-2, WR1-3, TE1-2), excluye lesionados Out/Doubtful.
+- **Backtest walk-forward:** re-entrena semana a semana de 2025 — la métrica honesta de cómo funcionará en temporada real.
+
+## Estructura
+
+| Archivo | Qué es |
+|---|---|
+| `nfl_pred.py` | Todo el pipeline (carga, features, entrenamiento, predicción, registro) |
+| `nfl_predictor.ipynb` | Interfaz interactiva (importa el módulo) |
+| `actualizar.py` | Script semanal: predice la próxima semana y evalúa las pasadas |
+| `.github/workflows/predicciones.yml` | GitHub Actions: corre `actualizar.py` cada martes |
+| `predicciones.csv` | Registro de predicciones (lo commitea el workflow) |
 
 ## Instalación
 
@@ -30,18 +37,24 @@ pip install -r requirements.txt
 jupyter notebook nfl_predictor.ipynb
 ```
 
-Ejecuta todas las celdas (entrena con 2020–2024, evalúa en 2025) y luego:
-
 ```python
-predecir_juego('KC', 'BUF')      # visitante BUF @ local KC (busca líneas en calendario oficial)
-predecir_semana(1)               # todos los juegos de la semana 1
-guardar_predicciones(1)          # guarda la semana en predicciones.csv
+from nfl_pred import *
+ctx = inicializar(walk_forward=True)
+
+predecir_juego('SEA', 'NE')      # visitante NE @ local SEA (usa calendario oficial)
+predecir_semana(1)               # todos los juegos de la semana, con flag value
+guardar_predicciones(1)          # anexa a predicciones.csv
 evaluar_predicciones()           # acierto real vs resultados y vs Vegas
 ```
 
 Abreviaturas nflverse: `KC, BUF, PHI, DAL, SF, SEA, NE, DEN, LA, LAC, GB, BAL, ...`
 
+## Automatización
+
+GitHub Actions corre cada **martes 14:00 UTC**: descarga datos frescos, re-entrena, predice la semana próxima y commitea `predicciones.csv`. En offseason no hace nada. Disparo manual: pestaña *Actions* → *Predicciones semanales* → *Run workflow*.
+
+Manual local: `python actualizar.py` (limpia caché y actualiza todo).
+
 ## Datos
 
-`nflreadpy` descarga y cachea automáticamente — no requiere API key.
-Durante la temporada, corre `nfl.clear_cache()` y re-ejecuta el notebook para datos frescos.
+`nflreadpy` descarga y cachea automáticamente — sin API key. Cuando la temporada actual tiene juegos jugados, el pipeline los incorpora solo al historial de forma.
