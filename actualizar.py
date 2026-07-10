@@ -48,6 +48,9 @@ def main():
     print('\nEvaluación de predicciones guardadas:')
     nfl_pred.evaluar_predicciones()
 
+    print('\nGenerando reporte HTML:')
+    nfl_pred.generar_reporte()
+
 
 if __name__ == '__main__':
     main()

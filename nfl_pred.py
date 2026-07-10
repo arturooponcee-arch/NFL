@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Pipeline de predicción NFL: datos nflverse (nflreadpy) + XGBoost.
+"""Pipeline de predicción NFL: datos nflverse (nflreadpy) + ensamble XGBoost/LightGBM/Ridge.
 
 Uso:
     import nfl_pred
@@ -8,6 +8,7 @@ Uso:
     nfl_pred.predecir_semana(1)
     nfl_pred.guardar_predicciones(1)
     nfl_pred.evaluar_predicciones()
+    nfl_pred.generar_reporte()             # docs/index.html para GitHub Pages
 """
 import os
 import warnings
@@ -18,7 +19,8 @@ import pandas as pd
 import polars as pl
 import nflreadpy as nfl
 from xgboost import XGBRegressor
-from sklearn.linear_model import LogisticRegression
+from lightgbm import LGBMRegressor
+from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.metrics import mean_absolute_error
 
 # ---------------- Configuración ----------------
@@ -27,6 +29,7 @@ TEMPORADA_TEST = 2025               # temporada de backtest
 TEMPORADA_ACTUAL = 2026             # temporada a predecir
 ROLL = 5                            # ventana de forma: últimos 5 juegos
 ARCHIVO_PRED = 'predicciones.csv'
+REPORTE_HTML = os.path.join('docs', 'index.html')
 UMBRAL_VALUE = 4.0                  # discrepancia (pts) para marcar posible value
 
 STAT_COLS = ['pts', 'pts_perm', 'pass_yds', 'rush_yds', 'pass_yds_perm', 'rush_yds_perm',
@@ -34,24 +37,35 @@ STAT_COLS = ['pts', 'pts_perm', 'pass_yds', 'rush_yds', 'pass_yds_perm', 'rush_y
 PCOLS = ['passing_yards', 'attempts', 'rushing_yards', 'carries',
          'receiving_yards', 'targets', 'target_share',
          'passing_tds', 'rushing_tds', 'receiving_tds', 'receptions', 'passing_interceptions']
+# snap counts + Next Gen Stats (pueden faltar por jugador-semana; XGBoost tolera NaN)
+EXTRA_PCOLS = ['snap_pct', 'cpoe', 'time_throw', 'ryoe_att', 'rush_eff', 'separacion', 'yac_ae']
 
+# feats = obligatorias (dropna al entrenar) | feats_opc = opcionales (NaN permitido)
 PROPS = {
     'yardas_pase':      dict(target='passing_yards', pos=['QB'], tipo='yardas',
-                             feats=['passing_yards_r', 'attempts_r', 'def_pase']),
+                             feats=['passing_yards_r', 'attempts_r', 'def_pase'],
+                             feats_opc=['snap_pct_r', 'cpoe_r', 'time_throw_r']),
     'yardas_tierra':    dict(target='rushing_yards', pos=['RB', 'QB', 'FB'], tipo='yardas',
-                             feats=['rushing_yards_r', 'carries_r', 'def_tierra']),
+                             feats=['rushing_yards_r', 'carries_r', 'def_tierra'],
+                             feats_opc=['snap_pct_r', 'ryoe_att_r', 'rush_eff_r']),
     'yardas_recepcion': dict(target='receiving_yards', pos=['WR', 'TE', 'RB', 'FB'], tipo='yardas',
-                             feats=['receiving_yards_r', 'targets_r', 'target_share_r', 'def_pase']),
+                             feats=['receiving_yards_r', 'targets_r', 'target_share_r', 'def_pase'],
+                             feats_opc=['snap_pct_r', 'separacion_r', 'yac_ae_r']),
     'td_pase':          dict(target='passing_tds', pos=['QB'], tipo='conteo',
-                             feats=['passing_tds_r', 'passing_yards_r', 'attempts_r', 'def_pase']),
+                             feats=['passing_tds_r', 'passing_yards_r', 'attempts_r', 'def_pase'],
+                             feats_opc=['snap_pct_r', 'cpoe_r']),
     'td_tierra':        dict(target='rushing_tds', pos=['RB', 'QB', 'FB'], tipo='conteo',
-                             feats=['rushing_tds_r', 'rushing_yards_r', 'carries_r', 'def_tierra']),
+                             feats=['rushing_tds_r', 'rushing_yards_r', 'carries_r', 'def_tierra'],
+                             feats_opc=['snap_pct_r', 'ryoe_att_r']),
     'td_recepcion':     dict(target='receiving_tds', pos=['WR', 'TE', 'RB', 'FB'], tipo='conteo',
-                             feats=['receiving_tds_r', 'receiving_yards_r', 'targets_r', 'def_pase']),
+                             feats=['receiving_tds_r', 'receiving_yards_r', 'targets_r', 'def_pase'],
+                             feats_opc=['snap_pct_r', 'separacion_r', 'yac_ae_r']),
     'recepciones':      dict(target='receptions', pos=['WR', 'TE', 'RB', 'FB'], tipo='conteo',
-                             feats=['receptions_r', 'targets_r', 'target_share_r', 'def_pase']),
+                             feats=['receptions_r', 'targets_r', 'target_share_r', 'def_pase'],
+                             feats_opc=['snap_pct_r', 'separacion_r']),
     'intercepciones':   dict(target='passing_interceptions', pos=['QB'], tipo='conteo',
-                             feats=['passing_interceptions_r', 'attempts_r', 'def_pase']),
+                             feats=['passing_interceptions_r', 'attempts_r', 'def_pase'],
+                             feats_opc=['snap_pct_r', 'cpoe_r']),
 }
 PROPS_POR_POS = {
     'QB': ['yardas_pase', 'td_pase', 'intercepciones', 'yardas_tierra', 'td_tierra'],
@@ -66,6 +80,28 @@ XGB_PARAMS = dict(n_estimators=400, learning_rate=0.04, max_depth=4,
 XGB_PROP = dict(n_estimators=300, learning_rate=0.05, max_depth=4,
                 subsample=0.8, colsample_bytree=0.8, random_state=42)
 
+
+class Ensamble:
+    """Promedio de XGBoost + LightGBM + Ridge para puntos por equipo."""
+
+    def __init__(self):
+        self.modelos = [
+            XGBRegressor(**XGB_PARAMS),
+            LGBMRegressor(n_estimators=400, learning_rate=0.04, max_depth=4,
+                          subsample=0.8, colsample_bytree=0.8,
+                          random_state=42, verbose=-1),
+            Ridge(alpha=1.0),
+        ]
+
+    def fit(self, X, y):
+        for m in self.modelos:
+            m.fit(X, y)
+        return self
+
+    def predict(self, X):
+        return np.mean([m.predict(X) for m in self.modelos], axis=0)
+
+
 ctx = {}   # estado compartido del pipeline
 
 
@@ -77,30 +113,47 @@ def rolling_shift(s):
 # ---------------- 1. Carga de datos ----------------
 def cargar_datos(seasons=None, temporada_actual=TEMPORADA_ACTUAL):
     seasons = list(seasons or SEASONS)
-    sched = nfl.load_schedules(seasons).to_pandas()
-    stats = nfl.load_player_stats(seasons).to_pandas()
-    pbp = pl.concat([
-        nfl.load_pbp([yr]).select(['season', 'week', 'posteam', 'defteam', 'epa', 'pass', 'rush'])
-        for yr in seasons
-    ]).to_pandas()
-
     calendario = nfl.load_schedules([temporada_actual]).to_pandas()
 
-    # si la temporada actual ya tiene juegos jugados, incluirlos en el historial
+    # si la temporada actual ya tiene juegos jugados, entra al historial completo
+    seasons_all = list(seasons)
     if calendario['home_score'].notna().any():
-        try:
-            sched = pd.concat([sched, calendario], ignore_index=True)
-            stats = pd.concat([stats, nfl.load_player_stats([temporada_actual]).to_pandas()],
-                              ignore_index=True)
-            pbp_act = nfl.load_pbp([temporada_actual]).select(
-                ['season', 'week', 'posteam', 'defteam', 'epa', 'pass', 'rush']).to_pandas()
-            pbp = pd.concat([pbp, pbp_act], ignore_index=True)
-            print(f'Incluyendo juegos ya jugados de {temporada_actual} en el historial')
-        except Exception as e:
-            print(f'No se pudieron cargar stats de {temporada_actual}: {e}')
+        seasons_all.append(temporada_actual)
+        print(f'Incluyendo juegos ya jugados de {temporada_actual} en el historial')
 
+    sched = nfl.load_schedules(seasons_all).to_pandas()
+    stats = nfl.load_player_stats(seasons_all).to_pandas()
+    pbp = pl.concat([
+        nfl.load_pbp([yr]).select(['season', 'week', 'posteam', 'defteam', 'epa', 'pass', 'rush'])
+        for yr in seasons_all
+    ]).to_pandas()
     sched = sched[sched['home_score'].notna()].copy()
     stats = stats[stats['season_type'].isin(['REG', 'POST'])].copy()
+
+    # snap counts (usa ids de PFR; se mapean a gsis con load_players)
+    players = nfl.load_players().to_pandas()[['gsis_id', 'pfr_id']].dropna()
+    snaps = nfl.load_snap_counts(seasons_all).to_pandas()
+    snaps = snaps.merge(players, left_on='pfr_player_id', right_on='pfr_id')
+    snaps = (snaps.groupby(['season', 'week', 'gsis_id'], as_index=False)
+                  .agg(snap_pct=('offense_pct', 'max'))
+                  .rename(columns={'gsis_id': 'player_id'}))
+
+    # Next Gen Stats (semanales; solo jugadores que cumplen umbral de la NFL)
+    ngs_defs = {
+        'passing':   {'completion_percentage_above_expectation': 'cpoe',
+                      'avg_time_to_throw': 'time_throw'},
+        'rushing':   {'rush_yards_over_expected_per_att': 'ryoe_att',
+                      'efficiency': 'rush_eff'},
+        'receiving': {'avg_separation': 'separacion',
+                      'avg_yac_above_expectation': 'yac_ae'},
+    }
+    ngs = []
+    for tipo, cols in ngs_defs.items():
+        d = nfl.load_nextgen_stats(seasons_all, stat_type=tipo).to_pandas()
+        d = d[d['week'] > 0]   # week 0 = agregado de temporada
+        d = d[['player_gsis_id', 'season', 'week'] + list(cols)].rename(
+            columns={'player_gsis_id': 'player_id', **cols})
+        ngs.append(d)
 
     roster = nfl.load_rosters([temporada_actual]).to_pandas()
     depth = (nfl.load_depth_charts([temporada_actual])
@@ -111,11 +164,12 @@ def cargar_datos(seasons=None, temporada_actual=TEMPORADA_ACTUAL):
         lesiones = pd.DataFrame(columns=['team', 'week', 'gsis_id', 'full_name', 'report_status'])
         print('Aviso: reportes de lesion aun no publicados (salen con la temporada)')
 
-    print(f'Juegos: {len(sched)} | Jugador-semanas: {len(stats)} | Jugadas pbp: {len(pbp)}')
+    print(f'Juegos: {len(sched)} | Jugador-semanas: {len(stats)} | Jugadas pbp: {len(pbp)} | '
+          f'Snaps: {len(snaps)} | NGS: {sum(len(d) for d in ngs)}')
     print(f'Calendario {temporada_actual}: {len(calendario)} juegos | Roster: {len(roster)} | '
           f'Depth chart: {len(depth)}')
-    ctx.update(sched=sched, stats=stats, pbp=pbp, calendario=calendario,
-               roster=roster, depth=depth, lesiones=lesiones)
+    ctx.update(sched=sched, stats=stats, pbp=pbp, calendario=calendario, roster=roster,
+               depth=depth, lesiones=lesiones, snaps=snaps, ngs=ngs)
     return ctx
 
 
@@ -188,12 +242,15 @@ def construir_features():
     m = tg.merge(opp_feats, on=['season', 'week', 'opp'], how='left')
     m = m.dropna(subset=feats_vegas + ['pts'])
 
-    # tabla jugador-juego
+    # tabla jugador-juego (+ snaps + Next Gen Stats)
     ps = stats[['player_id', 'player_display_name', 'position', 'season', 'week',
                 'team', 'opponent_team'] + PCOLS].copy()
     ps = ps.rename(columns={'player_display_name': 'jugador', 'opponent_team': 'opp'})
+    ps = ps.merge(ctx['snaps'], on=['player_id', 'season', 'week'], how='left')
+    for d in ctx['ngs']:
+        ps = ps.merge(d, on=['player_id', 'season', 'week'], how='left')
     ps = ps.sort_values(['player_id', 'season', 'week']).reset_index(drop=True)
-    for c in PCOLS:
+    for c in PCOLS + EXTRA_PCOLS:
         ps[f'{c}_r'] = ps.groupby('player_id')[c].transform(rolling_shift)
 
     defensa = tg[['season', 'week', 'team', 'pass_yds_perm_r', 'rush_yds_perm_r']].rename(
@@ -208,7 +265,7 @@ def construir_features():
 
 # ---------------- 3. Entrenamiento ----------------
 def _eval_juegos(test, col_pred):
-    locales = test[test['es_local'] == 1][['game_id', 'pts', col_pred, 'vegas_spread']]
+    locales = test[test['es_local'] == 1][['game_id', 'season', 'pts', col_pred, 'vegas_spread']]
     visitas = test[test['es_local'] == 0][['game_id', 'pts', col_pred]].rename(
         columns={'pts': 'pts_v', col_pred: 'pred_v'})
     j = locales.merge(visitas, on='game_id')
@@ -221,59 +278,66 @@ def entrenar(temporada_test=TEMPORADA_TEST):
     m = ctx['m']
     feats_puro, feats_vegas = ctx['feats_puro'], ctx['feats_vegas']
     train = m[m['season'] < temporada_test]
-    test = m[m['season'] == temporada_test].copy()
+    # backtest + calibración: 2025 y (si existen) juegos de la temporada actual,
+    # ambos fuera del entrenamiento -> la calibración se refresca sola cada semana
+    test_cal = m[m['season'] >= temporada_test].copy()
 
-    modelo_vegas = XGBRegressor(**XGB_PARAMS).fit(train[feats_vegas], train['pts'])
-    modelo_puro = XGBRegressor(**XGB_PARAMS).fit(train[feats_puro], train['pts'])
+    modelo_vegas = Ensamble().fit(train[feats_vegas], train['pts'])
+    modelo_puro = Ensamble().fit(train[feats_puro], train['pts'])
 
-    test['pred_vegas'] = modelo_vegas.predict(test[feats_vegas])
-    test['pred_puro'] = modelo_puro.predict(test[feats_puro])
+    test_cal['pred_vegas'] = modelo_vegas.predict(test_cal[feats_vegas])
+    test_cal['pred_puro'] = modelo_puro.predict(test_cal[feats_puro])
 
+    # métricas solo sobre la temporada de backtest
+    test = test_cal[test_cal['season'] == temporada_test]
     jv = _eval_juegos(test, 'pred_vegas')
     jp = _eval_juegos(test, 'pred_puro')
     acc_vegas_model = (np.sign(jv['dif_pred']) == np.sign(jv['dif_real'])).mean()
     acc_puro = (np.sign(jp['dif_pred']) == np.sign(jp['dif_real'])).mean()
     acc_linea = (np.sign(jv['vegas_spread']) == np.sign(jv['dif_real'])).mean()
     mae_pts = mean_absolute_error(test['pts'], test['pred_vegas'])
-    mae_total = mean_absolute_error(jv['pts'] + jv['pts_v'], jv[
-        'pred_vegas'] + jv['pred_v'])
+    mae_total = mean_absolute_error(jv['pts'] + jv['pts_v'], jv['pred_vegas'] + jv['pred_v'])
 
-    # calibrador de probabilidad: logística sobre [dif_puro, spread de Vegas]
-    Xc = np.column_stack([jp['dif_pred'], jp['vegas_spread']])
-    yc = (jp['dif_real'] > 0).astype(int)
+    # calibrador con TODO lo fuera de muestra (2025 + temporada actual jugada)
+    jp_cal = _eval_juegos(test_cal, 'pred_puro')
+    Xc = np.column_stack([jp_cal['dif_pred'], jp_cal['vegas_spread']])
+    yc = (jp_cal['dif_real'] > 0).astype(int)
     calibrador = LogisticRegression().fit(Xc, yc)
     acc_cal = (calibrador.predict(Xc) == yc).mean()
+    n_actual = int((jp_cal['season'] == TEMPORADA_ACTUAL).sum())
+    nota_cal = f' (re-calibrada con {n_actual} juegos de {TEMPORADA_ACTUAL})' if n_actual else ''
 
-    print(f'--- Backtest {temporada_test} (split simple) ---')
+    print(f'--- Backtest {temporada_test} (split simple, ensamble XGB+LGBM+Ridge) ---')
     print(f'MAE puntos por equipo: {mae_pts:.2f} | MAE total juego: {mae_total:.2f}')
     print(f'Acierto ganador - modelo puro: {acc_puro:.1%} | modelo c/Vegas: {acc_vegas_model:.1%} | '
-          f'linea Vegas: {acc_linea:.1%} | prob calibrada: {acc_cal:.1%}')
+          f'linea Vegas: {acc_linea:.1%} | prob calibrada: {acc_cal:.1%}{nota_cal}')
 
     # ---- props de jugador ----
     ps = ctx['ps']
     modelos_prop = {}
     for nombre, cfg in PROPS.items():
+        feats_full = cfg['feats'] + cfg['feats_opc']
         d = ps[ps['position'].isin(cfg['pos'])].dropna(subset=cfg['feats'] + [cfg['target']])
         tr, te = d[d['season'] < temporada_test], d[d['season'] == temporada_test]
         if cfg['tipo'] == 'yardas':
-            mod = XGBRegressor(**XGB_PROP).fit(tr[cfg['feats']], tr[cfg['target']])
+            mod = XGBRegressor(**XGB_PROP).fit(tr[feats_full], tr[cfg['target']])
             q16 = XGBRegressor(objective='reg:quantileerror', quantile_alpha=0.16,
-                               **XGB_PROP).fit(tr[cfg['feats']], tr[cfg['target']])
+                               **XGB_PROP).fit(tr[feats_full], tr[cfg['target']])
             q84 = XGBRegressor(objective='reg:quantileerror', quantile_alpha=0.84,
-                               **XGB_PROP).fit(tr[cfg['feats']], tr[cfg['target']])
-            modelos_prop[nombre] = dict(mod=mod, q16=q16, q84=q84)
+                               **XGB_PROP).fit(tr[feats_full], tr[cfg['target']])
+            modelos_prop[nombre] = dict(mod=mod, q16=q16, q84=q84, feats=feats_full)
         else:
             mod = XGBRegressor(objective='count:poisson', **XGB_PROP).fit(
-                tr[cfg['feats']], tr[cfg['target']])
-            modelos_prop[nombre] = dict(mod=mod)
-        mae = mean_absolute_error(te[cfg['target']], mod.predict(te[cfg['feats']]))
+                tr[feats_full], tr[cfg['target']])
+            modelos_prop[nombre] = dict(mod=mod, feats=feats_full)
+        mae = mean_absolute_error(te[cfg['target']], mod.predict(te[feats_full]))
         print(f'MAE {nombre}: {mae:.2f}  ({len(te)} jugador-juegos)')
 
     ctx.update(modelo_vegas=modelo_vegas, modelo_puro=modelo_puro,
                calibrador=calibrador, modelos_prop=modelos_prop,
                metricas=dict(mae_pts=mae_pts, mae_total=mae_total, acc_puro=acc_puro,
                              acc_vegas_model=acc_vegas_model, acc_linea=acc_linea,
-                             acc_calibrada=acc_cal))
+                             acc_calibrada=acc_cal, juegos_calibracion_actual=n_actual))
     return ctx
 
 
@@ -289,8 +353,8 @@ def backtest_walk_forward(temporada_test=TEMPORADA_TEST):
         te = m[(m['season'] == temporada_test) & (m['week'] == wk)].copy()
         if te.empty:
             continue
-        te['pred_vegas'] = XGBRegressor(**XGB_PARAMS).fit(tr[feats_vegas], tr['pts']).predict(te[feats_vegas])
-        te['pred_puro'] = XGBRegressor(**XGB_PARAMS).fit(tr[feats_puro], tr['pts']).predict(te[feats_puro])
+        te['pred_vegas'] = Ensamble().fit(tr[feats_vegas], tr['pts']).predict(te[feats_vegas])
+        te['pred_puro'] = Ensamble().fit(tr[feats_puro], tr['pts']).predict(te[feats_puro])
         piezas.append(te)
     wf = pd.concat(piezas, ignore_index=True)
     jv, jp = _eval_juegos(wf, 'pred_vegas'), _eval_juegos(wf, 'pred_puro')
@@ -369,7 +433,7 @@ def _snapshot_jugador(pid):
     d = ps[ps['player_id'] == pid].sort_values(['season', 'week']).tail(ROLL)
     if len(d) < 2:
         return None   # sin historial suficiente (ej. novato)
-    return {f'{c}_r': d[c].mean() for c in PCOLS}
+    return {f'{c}_r': d[c].mean() for c in PCOLS + EXTRA_PCOLS}
 
 
 def _props_equipo(team, opp_def, week=None):
@@ -381,9 +445,9 @@ def _props_equipo(team, opp_def, week=None):
             continue
         for prop in PROPS_POR_POS[j['pos_abb']]:
             cfg = PROPS[prop]
-            fila = pd.DataFrame([{**snap, 'def_pase': opp_def['def_pase'],
-                                  'def_tierra': opp_def['def_tierra']}])[cfg['feats']]
             mods = ctx['modelos_prop'][prop]
+            fila = pd.DataFrame([{**snap, 'def_pase': opp_def['def_pase'],
+                                  'def_tierra': opp_def['def_tierra']}])[mods['feats']]
             y = float(mods['mod'].predict(fila)[0])
             r = dict(equipo=team, jugador=j['player_name'], pos=j['pos_abb'],
                      prop=prop, prediccion=round(max(0.0, y), 2))
@@ -469,29 +533,130 @@ def guardar_predicciones(week, archivo=ARCHIVO_PRED):
     return df[df['week'] == week]
 
 
-def evaluar_predicciones(archivo=ARCHIVO_PRED):
-    if not os.path.exists(archivo):
-        print(f'No existe {archivo} - usa guardar_predicciones(week) primero')
-        return None
-    log = pd.read_csv(archivo)
+def _evaluar(log):
+    """Cruza el registro con resultados reales. Devuelve (df, resumen) o (None, None)."""
     res = nfl.load_schedules([TEMPORADA_ACTUAL]).to_pandas()
     res = res[res['home_score'].notna()][['week', 'home_team', 'away_team',
                                           'home_score', 'away_score']]
     ev = log.merge(res, left_on=['week', 'local', 'visitante'],
                    right_on=['week', 'home_team', 'away_team'])
     if ev.empty:
-        print('Aun no hay resultados para las predicciones guardadas')
-        return None
+        return None, None
     dif_real = ev['home_score'] - ev['away_score']
     ev['ganador_real'] = np.where(dif_real > 0, ev['local'], ev['visitante'])
     ev['acierto'] = ev['ganador'] == ev['ganador_real']
-    acierto_vegas = (np.sign(ev['spread_vegas']) == np.sign(dif_real)).mean()
-    print(f'Juegos evaluados: {len(ev)}')
-    print(f'Acierto ganador - modelo: {ev["acierto"].mean():.1%} | Vegas: {acierto_vegas:.1%}')
-    print(f'MAE total: {(ev["total_pred"] - (ev["home_score"] + ev["away_score"])).abs().mean():.2f}')
-    print(f'MAE spread: {(ev["spread_pred"] - dif_real).abs().mean():.2f}')
+    resumen = dict(
+        n=len(ev),
+        acc_modelo=float(ev['acierto'].mean()),
+        acc_vegas=float((np.sign(ev['spread_vegas']) == np.sign(dif_real)).mean()),
+        mae_total=float((ev['total_pred'] - (ev['home_score'] + ev['away_score'])).abs().mean()),
+        mae_spread=float((ev['spread_pred'] - dif_real).abs().mean()))
+    return ev, resumen
+
+
+def evaluar_predicciones(archivo=ARCHIVO_PRED):
+    if not os.path.exists(archivo):
+        print(f'No existe {archivo} - usa guardar_predicciones(week) primero')
+        return None
+    ev, resumen = _evaluar(pd.read_csv(archivo))
+    if ev is None:
+        print('Aun no hay resultados para las predicciones guardadas')
+        return None
+    print(f'Juegos evaluados: {resumen["n"]}')
+    print(f'Acierto ganador - modelo: {resumen["acc_modelo"]:.1%} | Vegas: {resumen["acc_vegas"]:.1%}')
+    print(f'MAE total: {resumen["mae_total"]:.2f}')
+    print(f'MAE spread: {resumen["mae_spread"]:.2f}')
     return ev[['week', 'local', 'visitante', 'pred_local', 'pred_visita',
                'home_score', 'away_score', 'ganador', 'ganador_real', 'acierto', 'prob']]
+
+
+# ---------------- 6. Reporte HTML (GitHub Pages) ----------------
+def generar_reporte(archivo=ARCHIVO_PRED, salida=REPORTE_HTML):
+    """Genera docs/index.html con la última semana guardada y el historial de aciertos."""
+    if not os.path.exists(archivo):
+        print(f'No existe {archivo} - nada que reportar')
+        return None
+    log = pd.read_csv(archivo)
+    sem = int(log['week'].max())
+    df = log[log['week'] == sem].sort_values('fecha')
+    ev, resumen = _evaluar(log)
+    ahora = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')
+
+    if resumen:
+        tarjeta_eval = f"""
+    <p class="resumen">Temporada {TEMPORADA_ACTUAL}: <b>{resumen['acc_modelo']:.0%}</b> de acierto
+    del modelo en {resumen['n']} juegos (Vegas: {resumen['acc_vegas']:.0%}) ·
+    error medio en totales: {resumen['mae_total']:.1f} pts.</p>"""
+    else:
+        tarjeta_eval = '<p class="resumen">Aún sin resultados para evaluar esta temporada.</p>'
+
+    filas_html = []
+    for _, r in df.iterrows():
+        badge = '<span class="value">VALUE</span>' if r['value'] else ''
+        filas_html.append(f"""      <tr>
+        <td>{r['fecha']}</td>
+        <td class="juego">{r['visitante']} @ {r['local']}</td>
+        <td>{r['local']} {r['pred_local']:.0f} - {r['pred_visita']:.0f} {r['visitante']}</td>
+        <td>{r['total_pred']:.1f} <small>({r['total_vegas']:.1f})</small></td>
+        <td>{r['spread_pred']:+.1f} <small>({r['spread_vegas']:+.1f})</small></td>
+        <td>{r['discrepancia']:+.1f} {badge}</td>
+        <td><b>{r['ganador']}</b> {r['prob']:.0%}</td>
+      </tr>""")
+
+    html = f"""<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Predicciones NFL - Semana {sem}</title>
+<style>
+  :root {{ color-scheme: light dark; --acento: #0b6e4f; --value: #b45309; }}
+  body {{ font-family: system-ui, -apple-system, sans-serif; margin: 2rem auto;
+         max-width: 60rem; padding: 0 1rem; line-height: 1.5; }}
+  h1 {{ margin-bottom: .2rem; }}
+  .sub {{ color: #888; margin-top: 0; }}
+  .resumen {{ background: color-mix(in srgb, var(--acento) 12%, transparent);
+             border-left: 4px solid var(--acento); padding: .7rem 1rem; border-radius: 6px; }}
+  .scroll {{ overflow-x: auto; }}
+  table {{ border-collapse: collapse; width: 100%; font-size: .93rem; }}
+  th, td {{ text-align: left; padding: .5rem .7rem; white-space: nowrap; }}
+  th {{ border-bottom: 2px solid var(--acento); }}
+  tr:nth-child(even) {{ background: color-mix(in srgb, currentColor 5%, transparent); }}
+  .juego {{ font-weight: 600; }}
+  small {{ color: #888; }}
+  .value {{ background: var(--value); color: #fff; border-radius: 4px;
+           padding: .1rem .4rem; font-size: .75rem; font-weight: 700; }}
+  footer {{ margin-top: 2rem; color: #888; font-size: .85rem; }}
+</style>
+</head>
+<body>
+<h1>🏈 Predicciones NFL</h1>
+<p class="sub">Semana {sem} · temporada {TEMPORADA_ACTUAL} · actualizado {ahora}</p>
+{tarjeta_eval}
+<p><b>VALUE</b> = el modelo sin Vegas discrepa más de {UMBRAL_VALUE:.0f} pts de la línea.
+Entre paréntesis, la línea de Vegas. Spread positivo = local favorito.</p>
+<div class="scroll">
+<table>
+  <thead>
+    <tr><th>Fecha</th><th>Juego</th><th>Marcador</th><th>Total (Vegas)</th>
+        <th>Spread (Vegas)</th><th>Discrepancia</th><th>Ganador · prob</th></tr>
+  </thead>
+  <tbody>
+{chr(10).join(filas_html)}
+  </tbody>
+</table>
+</div>
+<footer>Generado automáticamente con datos de nflverse ·
+<a href="https://github.com/arturooponcee-arch/NFL">código</a> ·
+<a href="https://raw.githubusercontent.com/arturooponcee-arch/NFL/main/predicciones.csv">predicciones.csv</a></footer>
+</body>
+</html>"""
+
+    os.makedirs(os.path.dirname(salida), exist_ok=True)
+    with open(salida, 'w', encoding='utf-8') as f:
+        f.write(html)
+    print(f'Reporte de semana {sem} escrito en {salida}')
+    return salida
 
 
 # ---------------- Punto de entrada ----------------

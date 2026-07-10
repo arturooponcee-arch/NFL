@@ -29,6 +29,6 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add predicciones.csv
+          git add predicciones.csv docs
           git diff --cached --quiet || git commit -m "Predicciones automáticas $(date +%F)"
           git push
