@@ -2,7 +2,8 @@ name: Predicciones semanales
 
 on:
   schedule:
-    - cron: '0 14 * * 2'   # martes 14:00 UTC (~8:00 CDMX)
+    - cron: '0 14 * * 2'   # martes 14:00 UTC (~8:00 CDMX): evalúa semana pasada + predicción temprana
+    - cron: '0 22 * * 5'   # viernes 22:00 UTC (~16:00 CDMX): re-predice con reporte final de lesiones
   workflow_dispatch: {}
 
 permissions:

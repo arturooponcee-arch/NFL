@@ -56,7 +56,12 @@ Abreviaturas nflverse: `KC, BUF, PHI, DAL, SF, SEA, NE, DEN, LA, LAC, GB, BAL, .
 
 ## Automatización
 
-GitHub Actions corre cada **martes 14:00 UTC**: descarga datos frescos, re-entrena, predice la semana próxima, commitea `predicciones.csv` y regenera el reporte web. En offseason no predice pero mantiene el reporte. Disparo manual: pestaña *Actions* → *Predicciones semanales* → *Run workflow*.
+GitHub Actions corre dos veces por semana:
+
+- **Martes 14:00 UTC** — con la jornada completa (incluye Monday Night): evalúa la semana pasada y hace la predicción temprana de la siguiente.
+- **Viernes 22:00 UTC** — re-predice la misma semana con el reporte final de lesiones (Out/Doubtful salen viernes) y el resultado del Thursday Night; sobrescribe sin duplicar.
+
+Cada corrida descarga datos frescos, re-entrena, commitea `predicciones.csv` y regenera el reporte web. En offseason no predice pero mantiene el reporte. Disparo manual: pestaña *Actions* → *Predicciones semanales* → *Run workflow*.
 
 **Reporte web:** activa GitHub Pages una sola vez (repo → *Settings* → *Pages* → Source: *Deploy from a branch*, Branch: `main`, carpeta `/docs`) y las predicciones quedan publicadas en `https://arturooponcee-arch.github.io/NFL/`.
 
