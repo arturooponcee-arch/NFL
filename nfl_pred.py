@@ -524,9 +524,23 @@ def predecir_semana(week):
 def guardar_predicciones(week, archivo=ARCHIVO_PRED):
     df = predecir_semana(week)
     df['fecha_prediccion'] = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')
+
+    # juegos de la semana ya jugados (ej. Thursday Night en la corrida del viernes):
+    # su predicción original NO se toca — re-predecir después del resultado sería trampa
+    cal = ctx['calendario']
+    jugados = cal[(cal['week'] == week) & (cal['home_score'].notna())]
+    jugados = set(zip(jugados['home_team'], jugados['away_team']))
+    if jugados:
+        n_prev = len(df)
+        df = df[~df.apply(lambda r: (r['local'], r['visitante']) in jugados, axis=1)]
+        print(f'{n_prev - len(df)} juego(s) ya jugados: se conserva su predicción original')
+
     if os.path.exists(archivo):
         prev = pd.read_csv(archivo)
-        prev = prev[~((prev['season'] == TEMPORADA_ACTUAL) & (prev['week'] == week))]
+        misma_semana = (prev['season'] == TEMPORADA_ACTUAL) & (prev['week'] == week)
+        pendiente = ~misma_semana | prev.apply(
+            lambda r: (r['local'], r['visitante']) in jugados, axis=1)
+        prev = prev[pendiente]
         df = pd.concat([prev, df], ignore_index=True)
     df.to_csv(archivo, index=False)
     print(f'{(df["week"] == week).sum()} juegos de semana {week} guardados en {archivo}')
