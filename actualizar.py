@@ -44,9 +44,14 @@ def main():
     else:
         print(f'\nPrediciendo semana {week} de {nfl_pred.TEMPORADA_ACTUAL}...')
         nfl_pred.guardar_predicciones(week)
+        print(f'\nProps de jugador de la semana {week}:')
+        nfl_pred.guardar_props(week)
 
     print('\nEvaluación de predicciones guardadas:')
     nfl_pred.evaluar_predicciones()
+
+    print('\nEvaluación de props guardados:')
+    nfl_pred.evaluar_props()
 
     print('\nGenerando reporte HTML:')
     nfl_pred.generar_reporte()

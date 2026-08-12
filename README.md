@@ -26,8 +26,9 @@ Predicción de juegos NFL con datos de [nflverse](https://github.com/nflverse) y
 | `nfl_predictor.ipynb` | Interfaz interactiva (importa el módulo) |
 | `actualizar.py` | Script semanal: predice la próxima semana, evalúa las pasadas y genera el reporte |
 | `.github/workflows/predicciones.yml` | GitHub Actions: corre `actualizar.py` cada martes |
-| `predicciones.csv` | Registro de predicciones (lo commitea el workflow) |
-| `docs/index.html` | Reporte web de la semana (GitHub Pages) |
+| `predicciones.csv` | Registro de predicciones por juego (lo commitea el workflow) |
+| `props.csv` | Registro de props por jugador (lo commitea el workflow) |
+| `docs/index.html` | Reporte web de la semana: pestañas Juegos / Props / Rendimiento |
 
 ## Instalación
 
@@ -45,12 +46,19 @@ jupyter notebook nfl_predictor.ipynb
 from nfl_pred import *
 ctx = inicializar(walk_forward=True)
 
-predecir_juego('SEA', 'NE')      # visitante NE @ local SEA (usa calendario oficial)
+predecir_juego('SEA', 'NE')      # visitante NE @ local SEA (marcador + props del juego)
 predecir_semana(1)               # todos los juegos de la semana, con flag value
+predecir_semana_props(1)         # props de todos los titulares de la semana
 guardar_predicciones(1)          # anexa a predicciones.csv
+guardar_props(1)                 # anexa a props.csv
 evaluar_predicciones()           # acierto real vs resultados y vs Vegas
+evaluar_props()                  # MAE por prop + calibración (cobertura / Brier)
 generar_reporte()                # docs/index.html para GitHub Pages
 ```
+
+Los props son **proyección pura**: no hay línea de casa que comparar, así que no se marca `value`
+como en los juegos. En yardas se publica el rango que cubre el 68% central; en conteos, la
+probabilidad de al menos 1.
 
 Abreviaturas nflverse: `KC, BUF, PHI, DAL, SF, SEA, NE, DEN, LA, LAC, GB, BAL, ...`
 
@@ -61,7 +69,9 @@ GitHub Actions corre dos veces por semana:
 - **Martes 14:00 UTC** — con la jornada completa (incluye Monday Night): evalúa la semana pasada y hace la predicción temprana de la siguiente.
 - **Viernes 22:00 UTC** — re-predice la misma semana con el reporte final de lesiones (Out/Doubtful salen viernes) y el resultado del Thursday Night; sobrescribe sin duplicar.
 
-Cada corrida descarga datos frescos, re-entrena, commitea `predicciones.csv` y regenera el reporte web. En offseason no predice pero mantiene el reporte. Disparo manual: pestaña *Actions* → *Predicciones semanales* → *Run workflow*.
+Cada corrida descarga datos frescos, re-entrena, commitea `predicciones.csv` y `props.csv`, y regenera el reporte web. En offseason no predice pero mantiene el reporte. Disparo manual: pestaña *Actions* → *Predicciones semanales* → *Run workflow*.
+
+Los juegos ya jugados **conservan su predicción original** en ambos registros: re-predecir con el resultado a la vista sería trampa.
 
 **Reporte web:** activa GitHub Pages una sola vez (repo → *Settings* → *Pages* → Source: *Deploy from a branch*, Branch: `main`, carpeta `/docs`) y las predicciones quedan publicadas en `https://arturooponcee-arch.github.io/NFL/`.
 

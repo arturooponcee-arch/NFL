@@ -10,6 +10,7 @@ Uso:
     nfl_pred.evaluar_predicciones()
     nfl_pred.generar_reporte()             # docs/index.html para GitHub Pages
 """
+import json
 import os
 import warnings
 warnings.filterwarnings('ignore')
@@ -29,6 +30,10 @@ TEMPORADA_TEST = 2025               # temporada de backtest
 TEMPORADA_ACTUAL = 2026             # temporada a predecir
 ROLL = 5                            # ventana de forma: últimos 5 juegos
 ARCHIVO_PRED = 'predicciones.csv'
+ARCHIVO_PROPS = 'props.csv'
+COLS_PROPS = ['season', 'week', 'fecha', 'juego', 'equipo', 'rival', 'es_local',
+              'player_id', 'jugador', 'pos', 'prop', 'prediccion', 'lo', 'hi',
+              'prob_1mas', 'fecha_prediccion']
 REPORTE_HTML = os.path.join('docs', 'index.html')
 UMBRAL_VALUE = 4.0                  # discrepancia (pts) para marcar posible value
 
@@ -72,6 +77,12 @@ PROPS_POR_POS = {
     'RB': ['yardas_tierra', 'td_tierra', 'yardas_recepcion', 'recepciones', 'td_recepcion'],
     'WR': ['yardas_recepcion', 'recepciones', 'td_recepcion'],
     'TE': ['yardas_recepcion', 'recepciones', 'td_recepcion'],
+}
+PROPS_LABEL = {
+    'yardas_pase': 'Yds pase', 'yardas_tierra': 'Yds tierra',
+    'yardas_recepcion': 'Yds recepción', 'td_pase': 'TD pase',
+    'td_tierra': 'TD tierra', 'td_recepcion': 'TD recepción',
+    'recepciones': 'Recepciones', 'intercepciones': 'Intercepciones',
 }
 LIM_DEPTH = {'QB': 1, 'RB': 2, 'WR': 3, 'TE': 2}
 
@@ -436,7 +447,13 @@ def _snapshot_jugador(pid):
     return {f'{c}_r': d[c].mean() for c in PCOLS + EXTRA_PCOLS}
 
 
+def _def_rival(snap):
+    """Traduce el snapshot de un equipo a las features defensivas que usan los props."""
+    return {'def_pase': snap['pass_yds_perm_r'], 'def_tierra': snap['rush_yds_perm_r']}
+
+
 def _props_equipo(team, opp_def, week=None):
+    """Devuelve (filas de props, titulares omitidos por falta de historial)."""
     filas, sin_historial = [], []
     for _, j in _titulares(team, week).iterrows():
         snap = _snapshot_jugador(j['gsis_id'])
@@ -449,19 +466,21 @@ def _props_equipo(team, opp_def, week=None):
             fila = pd.DataFrame([{**snap, 'def_pase': opp_def['def_pase'],
                                   'def_tierra': opp_def['def_tierra']}])[mods['feats']]
             y = float(mods['mod'].predict(fila)[0])
-            r = dict(equipo=team, jugador=j['player_name'], pos=j['pos_abb'],
-                     prop=prop, prediccion=round(max(0.0, y), 2))
+            r = dict(equipo=team, player_id=j['gsis_id'], jugador=j['player_name'],
+                     pos=j['pos_abb'], prop=prop, prediccion=round(max(0.0, y), 2))
             if cfg['tipo'] == 'yardas':
-                lo = min(float(mods['q16'].predict(fila)[0]), y)
+                # lo/hi numéricos para evaluar cobertura; rango_68pct es solo display
+                lo = max(0.0, min(float(mods['q16'].predict(fila)[0]), y))
                 hi = max(float(mods['q84'].predict(fila)[0]), y)
-                r['rango_68pct'] = f'{max(0, lo):.0f}-{hi:.0f}'
+                r['lo'], r['hi'] = round(lo, 2), round(hi, 2)
+                r['rango_68pct'] = f'{lo:.0f}-{hi:.0f}'
             else:
                 lam = max(0.0, y)
                 r['prob_1mas'] = round(1 - np.exp(-lam), 2)
             filas.append(r)
     if sin_historial:
         print(f'  Sin historial NFL ({team}): {", ".join(sin_historial)}')
-    return filas
+    return filas, sin_historial
 
 
 def predecir_juego(local, visitante, week=None):
@@ -492,8 +511,8 @@ def predecir_juego(local, visitante, week=None):
     print(f'Prob. victoria (calibrada): {local} {p_local:.0%} | {visitante} {1 - p_local:.0%}')
 
     def_l, def_v = _snapshot_equipo(local), _snapshot_equipo(visitante)
-    props = (_props_equipo(local, {'def_pase': def_v['pass_yds_perm_r'], 'def_tierra': def_v['rush_yds_perm_r']}, week)
-             + _props_equipo(visitante, {'def_pase': def_l['pass_yds_perm_r'], 'def_tierra': def_l['rush_yds_perm_r']}, week))
+    props = (_props_equipo(local, _def_rival(def_v), week)[0]
+             + _props_equipo(visitante, _def_rival(def_l), week)[0])
     df = pd.DataFrame(props).sort_values(['equipo', 'prop', 'prediccion'],
                                          ascending=[True, True, False])
     return df.reset_index(drop=True)
@@ -520,6 +539,29 @@ def predecir_semana(week):
     return pd.DataFrame(filas)
 
 
+def predecir_semana_props(week):
+    """Props de los titulares de todos los juegos de la semana.
+
+    Devuelve (DataFrame, lista de titulares omitidos por falta de historial).
+    """
+    filas, omitidos = [], []
+    for _, g in ctx['calendario'][ctx['calendario']['week'] == week].iterrows():
+        local, visita = g['home_team'], g['away_team']
+        juego = f'{visita} @ {local}'
+        def_l, def_v = _snapshot_equipo(local), _snapshot_equipo(visita)
+        # cada equipo se enfrenta a la defensa del rival
+        for team, rival, def_rival, es_local in ((local, visita, def_v, 1),
+                                                 (visita, local, def_l, 0)):
+            props, sin_historial = _props_equipo(team, _def_rival(def_rival), week)
+            omitidos += [f'{p} · {juego}' for p in sin_historial]
+            for r in props:
+                filas.append(dict(season=TEMPORADA_ACTUAL, week=week, fecha=g['gameday'],
+                                  juego=juego, rival=rival, es_local=es_local, **r))
+    df = pd.DataFrame(filas).reindex(columns=[c for c in COLS_PROPS
+                                              if c != 'fecha_prediccion'])
+    return df, omitidos
+
+
 # ---------------- 5. Registro ----------------
 def guardar_predicciones(week, archivo=ARCHIVO_PRED):
     df = predecir_semana(week)
@@ -544,6 +586,38 @@ def guardar_predicciones(week, archivo=ARCHIVO_PRED):
         df = pd.concat([prev, df], ignore_index=True)
     df.to_csv(archivo, index=False)
     print(f'{(df["week"] == week).sum()} juegos de semana {week} guardados en {archivo}')
+    return df[df['week'] == week]
+
+
+def guardar_props(week, archivo=ARCHIVO_PROPS):
+    df, omitidos = predecir_semana_props(week)
+    ctx['props_omitidos'] = omitidos
+    if df.empty:
+        print(f'Sin props para la semana {week} - no se escribe {archivo}')
+        return df
+    df['fecha_prediccion'] = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')
+
+    # mismo criterio que guardar_predicciones: lo ya jugado conserva su
+    # predicción original — re-predecir con el resultado a la vista sería trampa
+    cal = ctx['calendario']
+    jug = cal[(cal['week'] == week) & (cal['home_score'].notna())]
+    jugados = {f'{v} @ {l}' for l, v in zip(jug['home_team'], jug['away_team'])}
+    if jugados:
+        n_prev = len(df)
+        df = df[~df['juego'].isin(jugados)]
+        print(f'{n_prev - len(df)} props de juegos ya jugados: se conserva la original')
+
+    if os.path.exists(archivo):
+        prev = pd.read_csv(archivo)
+        if len(prev):
+            reemplazable = ((prev['season'] == TEMPORADA_ACTUAL) & (prev['week'] == week)
+                            & ~prev['juego'].isin(jugados))
+            df = pd.concat([prev[~reemplazable], df], ignore_index=True)
+    df = df.reindex(columns=COLS_PROPS)
+    df.to_csv(archivo, index=False)
+    print(f'{(df["week"] == week).sum()} props de semana {week} guardados en {archivo}')
+    if omitidos:
+        print(f'{len(omitidos)} titular(es) sin historial NFL, omitidos')
     return df[df['week'] == week]
 
 
@@ -584,8 +658,257 @@ def evaluar_predicciones(archivo=ARCHIVO_PRED):
                'home_score', 'away_score', 'ganador', 'ganador_real', 'acierto', 'prob']]
 
 
+def _evaluar_props(log):
+    """Cruza props guardados con lo que realmente hizo cada jugador.
+
+    Devuelve (df jugador-prop con el real, resumen por prop) o (None, None).
+    """
+    try:
+        real = nfl.load_player_stats([TEMPORADA_ACTUAL]).to_pandas()
+    except Exception:
+        # el archivo de stats por jugador no existe hasta que arranca la temporada
+        return None, None
+    real = real[real['season_type'].isin(['REG', 'POST'])]
+
+    partes = []
+    for prop, cfg in PROPS.items():
+        d = log[log['prop'] == prop]
+        if d.empty:
+            continue
+        r = real[['player_id', 'week', cfg['target']]].rename(
+            columns={cfg['target']: 'real'})
+        partes.append(d.merge(r, on=['player_id', 'week']))
+    ev = pd.concat(partes, ignore_index=True) if partes else pd.DataFrame()
+    if ev.empty:
+        return None, None
+
+    ev['error'] = (ev['prediccion'] - ev['real']).abs()
+    resumen = []
+    for prop, d in ev.groupby('prop', sort=False):
+        fila = dict(prop=prop, label=PROPS_LABEL[prop], n=len(d),
+                    mae=float(d['error'].mean()))
+        if PROPS[prop]['tipo'] == 'yardas':
+            # el rango es un intervalo del 68%: la cobertura debería rondar 0.68
+            fila['cobertura'] = float(((d['real'] >= d['lo']) &
+                                       (d['real'] <= d['hi'])).mean())
+        else:
+            hubo = (d['real'] >= 1).astype(float)
+            fila['acierto_1mas'] = float(((d['prob_1mas'] >= 0.5) == (hubo == 1)).mean())
+            fila['brier'] = float(((d['prob_1mas'] - hubo) ** 2).mean())
+        resumen.append(fila)
+    orden = list(PROPS)
+    resumen.sort(key=lambda f: orden.index(f['prop']))
+    return ev, resumen
+
+
+def evaluar_props(archivo=ARCHIVO_PROPS):
+    if not os.path.exists(archivo):
+        print(f'No existe {archivo} - usa guardar_props(week) primero')
+        return None
+    ev, resumen = _evaluar_props(pd.read_csv(archivo))
+    if ev is None:
+        print('Aun no hay resultados para los props guardados')
+        return None
+    print(f'Props evaluados: {len(ev)}')
+    for f in resumen:
+        extra = (f'cobertura rango: {f["cobertura"]:.0%}' if 'cobertura' in f
+                 else f'acierto 1+: {f["acierto_1mas"]:.0%} | Brier: {f["brier"]:.3f}')
+        print(f'  {f["label"]:<16} n={f["n"]:<5} MAE {f["mae"]:.2f} | {extra}')
+    return ev[['week', 'juego', 'equipo', 'jugador', 'pos', 'prop',
+               'prediccion', 'real', 'error']]
+
+
 # ---------------- 6. Reporte HTML (GitHub Pages) ----------------
-def generar_reporte(archivo=ARCHIVO_PRED, salida=REPORTE_HTML):
+# CSS y JS viven fuera del f-string del reporte: dentro habría que duplicar cada llave
+_CSS = """
+  :root { color-scheme: light dark; --acento: #0b6e4f; --value: #b45309; --borde: #8886; }
+  body { font-family: system-ui, -apple-system, sans-serif; margin: 2rem auto;
+         max-width: 68rem; padding: 0 1rem; line-height: 1.5; }
+  h1 { margin-bottom: .2rem; }
+  h2 { font-size: 1.1rem; margin: 1.6rem 0 .4rem; }
+  .sub { color: #888; margin-top: 0; }
+  .resumen { background: color-mix(in srgb, var(--acento) 12%, transparent);
+             border-left: 4px solid var(--acento); padding: .7rem 1rem; border-radius: 6px; }
+  .nota { color: #888; font-size: .88rem; }
+  .scroll { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: .93rem; }
+  th, td { text-align: left; padding: .5rem .7rem; white-space: nowrap; }
+  th { border-bottom: 2px solid var(--acento); }
+  tbody tr:nth-child(even) { background: color-mix(in srgb, currentColor 5%, transparent); }
+  .juego { font-weight: 600; }
+  small { color: #888; }
+  .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .value { background: var(--value); color: #fff; border-radius: 4px;
+           padding: .1rem .4rem; font-size: .75rem; font-weight: 700; }
+  .tabs { display: flex; gap: .25rem; flex-wrap: wrap;
+          border-bottom: 2px solid var(--acento); margin: 1.5rem 0 1.2rem; }
+  .tabs button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer;
+                 padding: .55rem 1.1rem; border-radius: 8px 8px 0 0; }
+  .tabs button:hover { background: color-mix(in srgb, var(--acento) 14%, transparent); }
+  .tabs button[aria-selected="true"] { background: var(--acento); color: #fff; font-weight: 600; }
+  [hidden] { display: none; }
+  .filtros { display: flex; gap: .6rem; flex-wrap: wrap; align-items: center; margin-bottom: 1rem; }
+  .filtros select, .filtros input { font: inherit; color: inherit; background: transparent;
+                                    border: 1px solid var(--borde); border-radius: 6px;
+                                    padding: .35rem .5rem; }
+  .conteo { color: #888; font-size: .85rem; margin-left: auto; }
+  footer { margin-top: 2rem; color: #888; font-size: .85rem; }
+"""
+
+_JS = """
+(function () {
+  var tabs = Array.prototype.slice.call(document.querySelectorAll('.tabs button'));
+  tabs.forEach(function (b) {
+    b.addEventListener('click', function () {
+      tabs.forEach(function (o) {
+        var activo = o === b;
+        o.setAttribute('aria-selected', activo ? 'true' : 'false');
+        document.getElementById(o.dataset.panel).hidden = !activo;
+      });
+    });
+  });
+
+  var datos = document.getElementById('datos-props');
+  if (!datos) return;
+  var props = JSON.parse(datos.textContent);
+  var orden = JSON.parse(document.getElementById('orden-props').textContent);
+  var fProp = document.getElementById('f-prop');
+  var fEquipo = document.getElementById('f-equipo');
+  var fPos = document.getElementById('f-pos');
+  var fJugador = document.getElementById('f-jugador');
+  var cuerpo = document.getElementById('props-body');
+  var conteo = document.getElementById('props-conteo');
+
+  function esc(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  function intervalo(p) {
+    if (p.lo !== null && p.lo !== undefined) {
+      return Math.round(p.lo) + '-' + Math.round(p.hi);
+    }
+    if (p.prob_1mas !== null && p.prob_1mas !== undefined) {
+      return Math.round(p.prob_1mas * 100) + '% de 1+';
+    }
+    return '';
+  }
+
+  function pintar() {
+    var q = fJugador.value.trim().toLowerCase();
+    var vistos = props.filter(function (p) {
+      return (!fProp.value || p.prop === fProp.value)
+          && (!fEquipo.value || p.equipo === fEquipo.value)
+          && (!fPos.value || p.pos === fPos.value)
+          && (!q || p.jugador.toLowerCase().indexOf(q) !== -1);
+    });
+    // sin filtro de prop, agrupa por tipo: mezclar yardas y TDs en un solo orden no dice nada
+    vistos.sort(function (a, b) {
+      if (!fProp.value && a.prop !== b.prop) {
+        return orden.indexOf(a.prop) - orden.indexOf(b.prop);
+      }
+      return b.prediccion - a.prediccion;
+    });
+    cuerpo.innerHTML = vistos.map(function (p) {
+      return '<tr><td class="juego">' + esc(p.jugador) + '</td>'
+           + '<td>' + esc(p.pos) + '</td>'
+           + '<td>' + esc(p.equipo) + '</td>'
+           + '<td>' + esc(p.juego) + '</td>'
+           + '<td>' + esc(p.label) + '</td>'
+           + '<td class="num"><b>' + p.prediccion.toFixed(1) + '</b></td>'
+           + '<td class="num">' + intervalo(p) + '</td></tr>';
+    }).join('');
+    conteo.textContent = vistos.length + ' de ' + props.length + ' props';
+  }
+
+  [fProp, fEquipo, fPos].forEach(function (s) { s.addEventListener('change', pintar); });
+  fJugador.addEventListener('input', pintar);
+  pintar();
+})();
+"""
+
+
+def _panel_props(sem, archivo_props):
+    """(html del panel de props, resumen de evaluación de props)."""
+    if not os.path.exists(archivo_props):
+        return '<p class="nota">Aún no hay props guardados.</p>', None
+    plog = pd.read_csv(archivo_props)
+    _, resumen_props = _evaluar_props(plog)
+    ps = plog[plog['week'] == sem].copy()
+    if ps.empty:
+        return f'<p class="nota">Aún no hay props guardados para la semana {sem}.</p>', resumen_props
+
+    ps['label'] = ps['prop'].map(PROPS_LABEL)
+    cols = ['jugador', 'pos', 'equipo', 'juego', 'prop', 'label', 'prediccion',
+            'lo', 'hi', 'prob_1mas']
+    # < evita que un '<' en los datos cierre el <script> antes de tiempo
+    datos = ps[cols].to_json(orient='records').replace('<', '\\u003c')
+    orden = json.dumps([p for p in PROPS]).replace('<', '\\u003c')
+
+    op_prop = ''.join(f'<option value="{p}">{PROPS_LABEL[p]}</option>'
+                      for p in PROPS if p in set(ps['prop']))
+    op_equipo = ''.join(f'<option value="{t}">{t}</option>' for t in sorted(ps['equipo'].unique()))
+    op_pos = ''.join(f'<option value="{p}">{p}</option>'
+                     for p in PROPS_POR_POS if p in set(ps['pos']))
+
+    n_omit = len(ctx.get('props_omitidos', []))
+    nota_omit = (f' {n_omit} titular(es) sin historial NFL quedaron fuera.' if n_omit else '')
+
+    return f"""<p class="nota">Proyección pura del modelo: no hay línea de casa que comparar,
+así que no se marca VALUE. En yardas, el rango cubre el 68% central;
+en conteos se muestra la probabilidad de al menos 1.{nota_omit}</p>
+<div class="filtros">
+  <select id="f-prop" aria-label="Filtrar por prop"><option value="">Todos los props</option>{op_prop}</select>
+  <select id="f-equipo" aria-label="Filtrar por equipo"><option value="">Todos los equipos</option>{op_equipo}</select>
+  <select id="f-pos" aria-label="Filtrar por posición"><option value="">Todas las posiciones</option>{op_pos}</select>
+  <input id="f-jugador" type="search" placeholder="Buscar jugador…" aria-label="Buscar jugador">
+  <span class="conteo" id="props-conteo"></span>
+</div>
+<div class="scroll">
+<table>
+  <thead>
+    <tr><th>Jugador</th><th>Pos</th><th>Equipo</th><th>Juego</th><th>Prop</th>
+        <th class="num">Proyección</th><th class="num">Rango / Prob</th></tr>
+  </thead>
+  <tbody id="props-body"></tbody>
+</table>
+</div>
+<script type="application/json" id="datos-props">{datos}</script>
+<script type="application/json" id="orden-props">{orden}</script>""", resumen_props
+
+
+def _panel_rendimiento(resumen, resumen_props):
+    if resumen:
+        juegos = f"""<h2>Juegos</h2>
+<p>Modelo <b>{resumen['acc_modelo']:.0%}</b> de acierto en {resumen['n']} juegos ·
+línea de Vegas {resumen['acc_vegas']:.0%} · MAE total {resumen['mae_total']:.2f} pts ·
+MAE spread {resumen['mae_spread']:.2f} pts.</p>"""
+    else:
+        juegos = '<h2>Juegos</h2>\n<p class="nota">Aún sin resultados de juegos para evaluar.</p>'
+
+    if not resumen_props:
+        return juegos + '\n<h2>Props</h2>\n<p class="nota">Aún sin resultados de props para evaluar.</p>'
+
+    filas = []
+    for f in resumen_props:
+        calib = (f'cobertura {f["cobertura"]:.0%}' if 'cobertura' in f
+                 else f'acierto 1+ {f["acierto_1mas"]:.0%} · Brier {f["brier"]:.3f}')
+        filas.append(f'      <tr><td>{f["label"]}</td><td class="num">{f["n"]}</td>'
+                     f'<td class="num">{f["mae"]:.2f}</td><td>{calib}</td></tr>')
+    return juegos + f"""
+<h2>Props</h2>
+<div class="scroll">
+<table>
+  <thead><tr><th>Prop</th><th class="num">n</th><th class="num">MAE</th><th>Calibración</th></tr></thead>
+  <tbody>
+{chr(10).join(filas)}
+  </tbody>
+</table>
+</div>
+<p class="nota">Cobertura = fracción de resultados que cayeron dentro del rango del 68%;
+cerca de 68% significa que el rango está bien calibrado. Brier más bajo es mejor.</p>"""
+
+
+def generar_reporte(archivo=ARCHIVO_PRED, salida=REPORTE_HTML, archivo_props=ARCHIVO_PROPS):
     """Genera docs/index.html con la última semana guardada y el historial de aciertos."""
     if not os.path.exists(archivo):
         print(f'No existe {archivo} - nada que reportar')
@@ -617,36 +940,28 @@ def generar_reporte(archivo=ARCHIVO_PRED, salida=REPORTE_HTML):
         <td><b>{r['ganador']}</b> {r['prob']:.0%}</td>
       </tr>""")
 
+    panel_props, resumen_props = _panel_props(sem, archivo_props)
+    panel_rend = _panel_rendimiento(resumen, resumen_props)
+
     html = f"""<!DOCTYPE html>
 <html lang="es">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Predicciones NFL - Semana {sem}</title>
-<style>
-  :root {{ color-scheme: light dark; --acento: #0b6e4f; --value: #b45309; }}
-  body {{ font-family: system-ui, -apple-system, sans-serif; margin: 2rem auto;
-         max-width: 60rem; padding: 0 1rem; line-height: 1.5; }}
-  h1 {{ margin-bottom: .2rem; }}
-  .sub {{ color: #888; margin-top: 0; }}
-  .resumen {{ background: color-mix(in srgb, var(--acento) 12%, transparent);
-             border-left: 4px solid var(--acento); padding: .7rem 1rem; border-radius: 6px; }}
-  .scroll {{ overflow-x: auto; }}
-  table {{ border-collapse: collapse; width: 100%; font-size: .93rem; }}
-  th, td {{ text-align: left; padding: .5rem .7rem; white-space: nowrap; }}
-  th {{ border-bottom: 2px solid var(--acento); }}
-  tr:nth-child(even) {{ background: color-mix(in srgb, currentColor 5%, transparent); }}
-  .juego {{ font-weight: 600; }}
-  small {{ color: #888; }}
-  .value {{ background: var(--value); color: #fff; border-radius: 4px;
-           padding: .1rem .4rem; font-size: .75rem; font-weight: 700; }}
-  footer {{ margin-top: 2rem; color: #888; font-size: .85rem; }}
-</style>
+<style>{_CSS}</style>
 </head>
 <body>
 <h1>🏈 Predicciones NFL</h1>
 <p class="sub">Semana {sem} · temporada {TEMPORADA_ACTUAL} · actualizado {ahora}</p>
 {tarjeta_eval}
+<div class="tabs" role="tablist">
+  <button type="button" role="tab" data-panel="tab-juegos" aria-selected="true">Juegos</button>
+  <button type="button" role="tab" data-panel="tab-props" aria-selected="false">Props de jugador</button>
+  <button type="button" role="tab" data-panel="tab-rend" aria-selected="false">Rendimiento</button>
+</div>
+
+<section id="tab-juegos" role="tabpanel">
 <p><b>VALUE</b> = el modelo sin Vegas discrepa más de {UMBRAL_VALUE:.0f} pts de la línea.
 Entre paréntesis, la línea de Vegas. Spread positivo = local favorito.</p>
 <div class="scroll">
@@ -660,9 +975,21 @@ Entre paréntesis, la línea de Vegas. Spread positivo = local favorito.</p>
   </tbody>
 </table>
 </div>
+</section>
+
+<section id="tab-props" role="tabpanel" hidden>
+{panel_props}
+</section>
+
+<section id="tab-rend" role="tabpanel" hidden>
+{panel_rend}
+</section>
+
 <footer>Generado automáticamente con datos de nflverse ·
 <a href="https://github.com/arturooponcee-arch/NFL">código</a> ·
-<a href="https://raw.githubusercontent.com/arturooponcee-arch/NFL/main/predicciones.csv">predicciones.csv</a></footer>
+<a href="https://raw.githubusercontent.com/arturooponcee-arch/NFL/main/predicciones.csv">predicciones.csv</a> ·
+<a href="https://raw.githubusercontent.com/arturooponcee-arch/NFL/main/props.csv">props.csv</a></footer>
+<script>{_JS}</script>
 </body>
 </html>"""
 
