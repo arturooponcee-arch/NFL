@@ -748,9 +748,12 @@ _CSS = """
   .tabs button[aria-selected="true"] { background: var(--acento); color: #fff; font-weight: 600; }
   [hidden] { display: none; }
   .filtros { display: flex; gap: .6rem; flex-wrap: wrap; align-items: center; margin-bottom: 1rem; }
-  .filtros select, .filtros input { font: inherit; color: inherit; background: transparent;
+  /* Canvas/CanvasText siguen a color-scheme: con background transparent el popup
+     del select usaba el fondo del sistema y el texto heredado, y se volvía ilegible */
+  .filtros select, .filtros input { font: inherit; color: CanvasText; background-color: Canvas;
                                     border: 1px solid var(--borde); border-radius: 6px;
                                     padding: .35rem .5rem; }
+  .filtros option { color: CanvasText; background-color: Canvas; }
   .conteo { color: #888; font-size: .85rem; margin-left: auto; }
   footer { margin-top: 2rem; color: #888; font-size: .85rem; }
 """
